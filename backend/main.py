@@ -1,13 +1,14 @@
 import os
 import requests
+import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from detection import DetectionEngine
 from sanitization import SanitizationEngine
-
-from huggingface_hub import InferenceClient
+from transformers import pipeline
+from session_logger import log_session_event, get_session_logs
 
 # Load environment variables
 load_dotenv()
@@ -17,20 +18,25 @@ app = FastAPI(title="Prompt Injection Detection System")
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For development, allow all
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Initialize engines
+print("Initializing Security Engines...")
 detection_engine = DetectionEngine()
 sanitization_engine = SanitizationEngine()
 
-# Configure Hugging Face
-hf_api_key = os.getenv("HUGGINGFACE_API_KEY")
-# Using the specific model path for better reliability
-client_hf = InferenceClient(model="openai-community/gpt2", token=hf_api_key)
+# Initialize Local LLM (GPT-2)
+print("Loading Local AI Model (GPT-2)... This may take a minute on first run.")
+try:
+    ai_model = pipeline("text-generation", model="gpt2", device=-1)
+    print("AI Model loaded successfully.")
+except Exception as e:
+    print(f"Error loading local model: {e}")
+    ai_model = None
 
 class AnalysisRequest(BaseModel):
     text: str
@@ -38,68 +44,109 @@ class AnalysisRequest(BaseModel):
 class ChatRequest(BaseModel):
     text: str
 
-@app.post("/analyze")
-async def analyze_input(request: AnalysisRequest):
-    result = detection_engine.get_combined_score(request.text)
-    return result
+def filter_output(text: str) -> str:
+    """Filters AI output for harmful patterns (OWASP LLM02)."""
+    if any(tag in text.lower() for tag in ["<script>", "javascript:", "onload=", "onerror="]):
+        return "[SECURITY_NOTICE: Potential malicious script detected in AI output and blocked.]"
+    return text
 
-@app.post("/sanitize")
-async def sanitize_input(request: AnalysisRequest):
-    sanitized_text = sanitization_engine.sanitize(request.text)
-    return {"original": request.text, "sanitized": sanitized_text}
+@app.get("/logs")
+async def get_logs():
+    return get_session_logs()
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    # 1. Analyze
-    analysis = detection_engine.get_combined_score(request.text)
-    print(f"DEBUG: Analysis for '{request.text[:20]}...': {analysis['classification']} (Score: {analysis['score']})")
+    # 1. PII Detection & Redaction Layer (Regex/NER)
+    redacted_input, pii_types = sanitization_engine.detect_and_redact_pii(request.text)
     
-    # 2. Decide
-    if analysis["classification"] == "BLOCK":
+    # 2. Attack Detection Layer (ML + Rules)
+    # Analyze the REDACTED text to avoid false positives on raw PII
+    lines = redacted_input.split('\n')
+    safe_lines = []
+    malicious_segments_removed = False
+    
+    for line in lines:
+        clean_line = line.strip()
+        if not clean_line: continue
+            
+        line_analysis = detection_engine.get_combined_score(clean_line)
+        if line_analysis["classification"] == "SAFE":
+            safe_lines.append(clean_line)
+        else:
+            malicious_segments_removed = True
+    
+    # 3. Reconstruct safe prompt
+    text_to_send = "\n".join(safe_lines)
+    
+    if not safe_lines:
+        analysis = detection_engine.get_combined_score(redacted_input)
+        bot_response = "🚨 CRITICAL BLOCK: Your entire request was identified as malicious."
+        log_session_event(request.text, bot_response, analysis, "")
         return {
             "analysis": analysis,
-            "response": "BLOCK: Your input was identified as a security risk and has been blocked.",
-            "sanitized_text": None
+            "response": bot_response,
+            "sanitized_text": ""
         }
     
-    # 3. Sanitize if Warning
-    text_to_send = request.text
-    sanitized_text = None
-    if analysis["classification"] == "WARNING":
-        sanitized_text = sanitization_engine.sanitize(request.text)
-        text_to_send = sanitized_text
-        
-    # 4. Generate Response
-    if analysis["classification"] == "SAFE":
-        # Force the 2-line professional response for SAFE prompts as requested
-        bot_response = (
-            f"The prompt '{request.text[:30]}' has been scanned and verified as SAFE.\n"
-            "AI Security Shield confirmed no malicious injection patterns or adversarial instructions were detected."
-        )
+    # 4. Final Analysis & Decision Engine
+    if malicious_segments_removed:
+        display_analysis = {
+            "score": 45.0,
+            "ml_score": 0.0,
+            "rule_score": 45.0,
+            "classification": "WARNING",
+            "threat_type": "Injection Sanitized",
+            "patterns_matched": ["Multi-part Injection Neutralized"],
+            "detected_contexts": ["SECURED"]
+        }
     else:
-        # For WARNING level, we still try the AI but fallback if it fails
+        # Check if we have PII but it's otherwise SAFE
+        raw_analysis = detection_engine.get_combined_score(text_to_send)
+        if pii_types and raw_analysis["classification"] == "SAFE":
+            display_analysis = raw_analysis.copy()
+            display_analysis["threat_type"] = f"PII Detected ({', '.join(pii_types)})"
+            # Keep score low as it's not an attack
+            display_analysis["score"] = min(display_analysis["score"], 20.0) 
+        else:
+            display_analysis = raw_analysis
+
+    # 5. Generate Response locally
+    if ai_model:
         try:
-            bot_response = client_hf.text_generation(
-                text_to_send,
-                max_new_tokens=80,
-                return_full_text=False
-            )
-            if not bot_response: raise Exception("No response")
-        except Exception:
-            bot_response = (
-                f"Input '{request.text[:30]}' was sanitized due to security warnings.\n"
-                "Potentially dangerous keywords were neutralized to ensure a secure processing environment."
-            )
+            formatted_prompt = f"Question: {text_to_send}\nAnswer:"
+            output = ai_model(formatted_prompt, max_new_tokens=40, num_return_sequences=1, truncation=True)
+            
+            full_text = output[0]['generated_text']
+            if "Answer:" in full_text:
+                response_body = full_text.split("Answer:")[1].strip()
+            else:
+                response_body = full_text.replace(formatted_prompt, "").strip()
+            
+            bot_response_text = response_body.split('\n')[0]
+            
+            # Filter Output (OWASP LLM02)
+            bot_response_text = filter_output(bot_response_text)
+            
+            if malicious_segments_removed:
+                bot_response = f"[SECURE SCAN: INJECTION BLOCKED] AI: {bot_response_text}"
+            else:
+                bot_response = f"[SECURE SCAN: CLEAN] AI: {bot_response_text}"
+        except Exception as e:
+            bot_response = f"Sanitized, but local AI error: {str(e)[:50]}"
+    else:
+        bot_response = "Security check passed, but AI model failed to load locally."
+
+    log_session_event(request.text, bot_response, display_analysis, text_to_send)
 
     return {
-        "analysis": analysis,
+        "analysis": display_analysis,
         "response": bot_response,
-        "sanitized_text": sanitized_text
+        "sanitized_text": text_to_send
     }
 
 @app.get("/")
 async def root():
-    return {"message": "Prompt Injection Detection API is running with GPT-Neo"}
+    return {"message": "Detection API (Local Mode) is online"}
 
 if __name__ == "__main__":
     import uvicorn
