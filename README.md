@@ -57,39 +57,35 @@ As Large Language Models (LLMs) are integrated into mission-critical pipelines, 
 
 ## 🏛️ System Architecture
 
-```mermaid
-flowchart TD
-    User([👤 User / Client Prompt]) --> Proxy[🛡️ GuardLLM Security Gateway]
 
-    subgraph Defense_Pipeline [" Multi-Layer Defense Pipeline "]
+flowchart TD
+    User(["👤 User / Client Prompt"]) --> Proxy["🛡️ GuardLLM Security Gateway"]
+
+    subgraph Defense_Pipeline["Multi-Layer Defense Pipeline"]
         direction TB
-        L1["Layer 1: PII Sanitization & Redaction\n(OWASP LLM06)"]
-        L2["Layer 2: Obfuscation Normalizer & Recursive Decoder\n(Homoglyphs, Leet, Zero-Width, Base64, Hex, ROT13)"]
-        L3["Layer 3: Context-Aware Rule Engine\n(Harmful, Roleplay, System, Hacking, Data Exfil)"]
-        L4["Layer 4: Neural ML Classifier\n(ProtectAI/deberta-v3-base-prompt-injection-v2)"]
-        
+        L1["Layer 1: PII Sanitization and Redaction<br/>OWASP LLM06"]
+        L2["Layer 2: Obfuscation Normalizer and Recursive Decoder<br/>Homoglyphs, Leet, Zero-Width, Base64, Hex, ROT13"]
+        L3["Layer 3: Context-Aware Rule Engine<br/>Harmful, Roleplay, System, Hacking, Data Exfiltration"]
+        L4["Layer 4: Neural ML Classifier<br/>ProtectAI DeBERTa-v3"]
+
         L1 --> L2 --> L3 --> L4
     end
 
-    Proxy --> Defense_Pipeline
+    Proxy --> L1
+    L4 --> Decision{"⚡ Threat Assessment"}
 
-    Defense_Pipeline --> Decision{⚡ Threat Assessment}
-    
-    Decision -- "CRITICAL ATTACK\n(Score > 70%)" --> Block[🚨 CRITICAL BLOCK\nThreat Intercepted & Logged]
-    Decision -- "INJECTION DETECTED\n(Score 30-70%)" --> Sanitize[🧹 Split & Sanitize Prompt\nStrip Malicious Segment]
-    Decision -- "BENIGN / SAFE\n(Score < 30%)" --> CleanPrompt[✅ Forward Clean Prompt]
+    Decision -->|"CRITICAL ATTACK: Score > 70%"| Block["🚨 CRITICAL BLOCK<br/>Threat Intercepted and Logged"]
+    Decision -->|"INJECTION: Score 30-70%"| Sanitize["🧹 Split and Sanitize Prompt<br/>Remove Malicious Segment"]
+    Decision -->|"BENIGN: Score < 30%"| CleanPrompt["✅ Forward Clean Prompt"]
 
-    Sanitize --> TargetLLM[🧠 Sandboxed Target LLM\n(Local GPT-2 / API)]
+    Sanitize --> TargetLLM["🧠 Sandboxed Target LLM<br/>Local GPT-2 or API"]
     CleanPrompt --> TargetLLM
 
-    TargetLLM --> OutputFilter["🛡️ Output Guard (OWASP LLM02)\nXSS & Script Filtering"]
-    OutputFilter --> Response([💬 Secure AI Response to User])
+    TargetLLM --> OutputFilter["🛡️ Output Guard<br/>OWASP LLM02: XSS and Script Filtering"]
+    OutputFilter --> Response(["💬 Secure AI Response to User"])
 
-    Decision -. Log Event .-> AuditLogs[📂 Audit Logs\nsession_logs.json / CSV]
+    Decision -.-> AuditLogs["📂 Audit Logs<br/>JSON and CSV"]
     Block --> Response
-```
-
----
 
 ## 🔬 Multi-Layer Defense Pipeline
 
